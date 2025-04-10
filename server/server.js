@@ -2,7 +2,6 @@
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
-const WebSocket = require('ws');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const rateLimit = require('express-rate-limit');
@@ -11,7 +10,6 @@ const rateLimit = require('express-rate-limit');
 const {
   PORT = 3000,
   NODE_ENV = 'development',
-  WS_PATH = '/ws',
   PING_INTERVAL = 30000,
   PONG_TIMEOUT = 10000,
   API_KEY,
@@ -43,52 +41,6 @@ const log = (level, message, ...args) => {
 const app = express();
 const server = http.createServer(app);
 
-// Middleware to validate API key
-const checkApiKey = (req, res, next) => {
-    const apiKey = req.headers['x-api-key'];
-    log('debug', `Checking API Key. Provided: ${apiKey ? 'Yes' : 'No'}`);
-    if (!API_KEY) {
-      log('warn', 'API_KEY is not set in the environment. Allowing request without check.');
-      return next(); // Allow if server has no key configured (development/testing)
-    }
-    if (!apiKey || apiKey !== API_KEY) {
-        log('warn', `Unauthorized access attempt. Provided Key: ${apiKey}`);
-        return res.status(401).json({ error: 'Unauthorized', message: 'Invalid API Key' });
-    }
-    log('debug', 'API Key validated successfully.');
-    next();
-};
-
-// Function to verify WebSocket client during handshake
-const verifyClient = (info, done) => {
-  const apiKey = info.req.headers['x-api-key'];
-  console.log('=== WebSocket Connection Attempt ===');
-  console.log(`Connection from: ${info.req.socket.remoteAddress}`);
-  console.log(`Headers received: ${JSON.stringify(info.req.headers)}`);
-  console.log(`API Key from client: ${apiKey || 'None'}`);
-  console.log(`API Key expected: ${API_KEY}`);
-  console.log(`Match: ${apiKey === API_KEY ? 'Yes' : 'No'}`);
-  
-  if (!API_KEY) {
-      console.log('API_KEY not set in environment. Allowing connection.');
-      return done(true); // Allow if server has no key configured
-  }
-  if (apiKey && apiKey === API_KEY) {
-    console.log('WebSocket API Key validated successfully.');
-    done(true); // API key is valid
-  } else {
-    console.log(`WebSocket connection rejected: Invalid API Key`);
-    done(false, 401, 'Unauthorized: Invalid API Key'); // Reject connection
-  }
-};
-
-// Setup WebSocket server with custom path and client verification
-const wss = new WebSocket.Server({ 
-  server,
-  path: WS_PATH,
-  verifyClient: verifyClient // Add verification hook
-});
-
 // Enable CORS for cross-origin requests
 app.use(cors());
 
@@ -104,69 +56,138 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Store connected WebSocket clients
+// Middleware to validate API key
+const checkApiKey = (req, res, next) => {
+    const apiKey = req.headers['x-api-key'];
+    log('debug', `Checking API Key. Provided: ${apiKey ? 'Yes' : 'No'}`);
+    if (!apiKey || apiKey !== API_KEY) {
+        log('warn', `Unauthorized access attempt. Provided Key: ${apiKey}`);
+        return res.status(401).json({ error: 'Unauthorized', message: 'Invalid API Key' });
+    }
+    log('debug', 'API Key validated successfully.');
+    next();
+};
+
+// Queue for storing pending requests per client
 const connectedClients = new Map();
 let clientIdCounter = 1;
 
-// Handle WebSocket connections
-wss.on('connection', (ws, req) => {
+// Long Polling Client Registration Endpoint
+app.post('/register', checkApiKey, (req, res) => {
   const clientId = clientIdCounter++;
-  // Extract client IP from headers if possible (useful for logging)
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  log('info', `Remote client ${clientId} connected from ${clientIp}`);
   
-  // Store client connection with metadata
+  log('info', `Remote client ${clientId} registered from ${clientIp}`);
+  
   connectedClients.set(clientId, {
-    ws,
+    pendingRequests: new Map(),
+    pendingPolls: [],   // Array for clients waiting on long polling
     isAlive: true,
-    pendingRequests: new Map()
+    lastSeen: Date.now()
   });
-
-  // Setup ping/pong heartbeat
-  ws.on('pong', () => {
-    const client = connectedClients.get(clientId);
-    if (client) {
-      client.isAlive = true;
-    }
+  
+  res.status(200).json({
+    status: 'ok',
+    clientId,
+    message: 'Client registered successfully'
   });
+});
 
-  // Handle incoming messages from clients
-  ws.on('message', (message) => {
-    try {
-      const response = JSON.parse(message.toString());
-      
-      // Process response for pending requests
-      if (response.requestId && connectedClients.has(clientId)) {
-        const client = connectedClients.get(clientId);
-        const pendingRequest = client.pendingRequests.get(response.requestId);
-        
-        if (pendingRequest) {
-          // Send response back to HTTP client
-          const { res } = pendingRequest;
-          
-          res.status(response.statusCode || 200)
-             .set(response.headers || {})
-             .send(response.body || {});
-          
-          // Clean up pending request
-          client.pendingRequests.delete(response.requestId);
-        }
-      }
-    } catch (error) {
-      log('error', 'Error processing message:', error);
-    }
+// Long Polling Client Heartbeat
+app.post('/heartbeat/:clientId', checkApiKey, (req, res) => {
+  const clientId = parseInt(req.params.clientId, 10);
+  
+  if (!connectedClients.has(clientId)) {
+    return res.status(404).json({
+      error: 'Client not found',
+      message: 'The specified client is not registered'
+    });
+  }
+  
+  const client = connectedClients.get(clientId);
+  client.isAlive = true;
+  client.lastSeen = Date.now();
+  
+  res.status(200).json({
+    status: 'ok',
+    message: 'Heartbeat received'
   });
+});
 
-  // Handle client disconnection
-  ws.on('close', () => {
-    log('info', `Remote client ${clientId} disconnected`);
-    connectedClients.delete(clientId);
+// Long Polling Endpoint - For client to wait for requests
+app.get('/poll/:clientId', checkApiKey, (req, res) => {
+  const clientId = parseInt(req.params.clientId, 10);
+  
+  if (!connectedClients.has(clientId)) {
+    return res.status(404).json({
+      error: 'Client not found',
+      message: 'The specified client is not registered'
+    });
+  }
+  
+  const client = connectedClients.get(clientId);
+  client.isAlive = true;
+  client.lastSeen = Date.now();
+  
+  // Check if client has a pending request
+  if (client.pendingRequests.size > 0) {
+    // Get the first pending request
+    const [requestId, requestData] = Array.from(client.pendingRequests.entries())[0];
+    client.pendingRequests.delete(requestId);
+    
+    log('info', `Sending pending request ${requestId} to client ${clientId}`);
+    return res.status(200).json(requestData);
+  }
+  
+  // If no pending request, use long polling
+  const timeoutDuration = parseInt(PONG_TIMEOUT);
+  const pollTimeout = setTimeout(() => {
+    // On timeout, remove client from poll list and send empty response
+    client.pendingPolls = client.pendingPolls.filter(poll => poll !== res);
+    res.status(204).end(); // No Content - signal to client that there's "nothing to wait for"
+  }, timeoutDuration);
+  
+  // Add client to polling array
+  client.pendingPolls.push(res);
+  
+  // Clean up when request is closed or cancelled
+  req.on('close', () => {
+    clearTimeout(pollTimeout);
+    client.pendingPolls = client.pendingPolls.filter(poll => poll !== res);
   });
+});
 
-  // Handle WebSocket errors
-  ws.on('error', (error) => {
-    log('error', `Error with client ${clientId}:`, error);
-    connectedClients.delete(clientId);
+// Endpoint for responses from client
+app.post('/response/:clientId', checkApiKey, (req, res) => {
+  const clientId = parseInt(req.params.clientId, 10);
+  const { requestId, statusCode, headers, body } = req.body;
+  
+  if (!connectedClients.has(clientId)) {
+    return res.status(404).json({
+      error: 'Client not found',
+      message: 'The specified client is not registered'
+    });
+  }
+  
+  const client = connectedClients.get(clientId);
+  const pendingRequest = client.pendingRequests.get(requestId);
+  
+  if (pendingRequest && pendingRequest.res) {
+    // Send HTTP response to client
+    const response = pendingRequest.res;
+    
+    response.status(statusCode || 200)
+     .set(headers || {})
+     .send(body || {});
+    
+    // Clean up the pending request
+    clearTimeout(pendingRequest.timeout);
+    client.pendingRequests.delete(requestId);
+  }
+  
+  res.status(200).json({
+    status: 'ok',
+    message: 'Response processed'
   });
 });
 
@@ -185,7 +206,8 @@ app.get('/health', checkApiKey, (req, res) => {
 app.get('/clients', checkApiKey, (req, res) => {
   const clients = Array.from(connectedClients.keys()).map(id => ({
     id,
-    pendingRequests: connectedClients.get(id).pendingRequests.size
+    pendingRequests: connectedClients.get(id).pendingRequests.size,
+    lastSeen: new Date(connectedClients.get(id).lastSeen).toISOString()
   }));
   
   res.status(200).json({
@@ -239,8 +261,12 @@ app.all('/api/:clientId/*', checkApiKey, async (req, res) => {
     // Store pending request
     client.pendingRequests.set(requestId, { res, timeout });
     
-    // Forward request to client
-    client.ws.send(JSON.stringify(requestData));
+    // If client has a pending poll request, send this request there
+    if (client.pendingPolls.length > 0) {
+      const pollRes = client.pendingPolls.shift();
+      log('info', `Sending request ${requestId} to waiting poll for client ${clientId}`);
+      pollRes.status(200).json(requestData);
+    }
     
   } catch (error) {
     log('error', 'Error forwarding request:', error);
@@ -251,23 +277,42 @@ app.all('/api/:clientId/*', checkApiKey, async (req, res) => {
   }
 });
 
-// Keep WebSocket connections alive
-const interval = setInterval(() => {
+// Inactive client cleanup
+const cleanupInterval = setInterval(() => {
+  const now = Date.now();
+  const maxAge = parseInt(PING_INTERVAL) * 2; // 2x the ping interval
+  
   connectedClients.forEach((client, id) => {
-    if (client.isAlive === false) {
-      client.ws.terminate();
+    if (now - client.lastSeen > maxAge) {
+      log('info', `Cleaning up inactive client ${id}`);
+      
+      // Clean up all pending requests
+      client.pendingRequests.forEach(request => {
+        if (request.timeout) clearTimeout(request.timeout);
+        if (request.res) {
+          request.res.status(504).json({
+            error: 'Gateway Timeout',
+            message: 'Remote client disconnected'
+          });
+        }
+      });
+      
+      // Clean up pending poll requests
+      client.pendingPolls.forEach(pollRes => {
+        pollRes.status(410).json({
+          error: 'Gone',
+          message: 'Client disconnected'
+        });
+      });
+      
       connectedClients.delete(id);
-      return;
     }
-    
-    client.isAlive = false;
-    client.ws.ping();
   });
 }, parseInt(PING_INTERVAL));
 
 // Clean up on server shutdown
 server.on('close', () => {
-  clearInterval(interval);
+  clearInterval(cleanupInterval);
 });
 
 // Start the server
