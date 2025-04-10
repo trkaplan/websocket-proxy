@@ -62,16 +62,22 @@ const checkApiKey = (req, res, next) => {
 // Function to verify WebSocket client during handshake
 const verifyClient = (info, done) => {
   const apiKey = info.req.headers['x-api-key'];
-  log('debug', `Verifying WebSocket connection. Provided API Key: ${apiKey ? 'Yes' : 'No'}`);
+  console.log('=== WebSocket Connection Attempt ===');
+  console.log(`Connection from: ${info.req.socket.remoteAddress}`);
+  console.log(`Headers received: ${JSON.stringify(info.req.headers)}`);
+  console.log(`API Key from client: ${apiKey || 'None'}`);
+  console.log(`API Key expected: ${API_KEY}`);
+  console.log(`Match: ${apiKey === API_KEY ? 'Yes' : 'No'}`);
+  
   if (!API_KEY) {
-      log('warn', 'API_KEY is not set in the environment. Allowing WS connection without check.');
+      console.log('API_KEY not set in environment. Allowing connection.');
       return done(true); // Allow if server has no key configured
   }
   if (apiKey && apiKey === API_KEY) {
-    log('debug', 'WebSocket API Key validated successfully.');
+    console.log('WebSocket API Key validated successfully.');
     done(true); // API key is valid
   } else {
-    log('warn', `WebSocket connection rejected. Invalid API Key provided: ${apiKey}`);
+    console.log(`WebSocket connection rejected: Invalid API Key`);
     done(false, 401, 'Unauthorized: Invalid API Key'); // Reject connection
   }
 };
