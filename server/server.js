@@ -322,3 +322,5 @@ server.listen(PORT, () => {
 
 // Export for Vercel
 module.exports = app;
+
+app.set('trust proxy', true);
