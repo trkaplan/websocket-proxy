@@ -1,0 +1,21 @@
+{
+    "name": "websocket-api-client",
+    "version": "1.0.0",
+    "description": "WebSocket client that connects to Vercel and forwards API requests to internal services",
+    "main": "client.js",
+    "scripts": {
+      "start": "node client.js",
+      "dev": "nodemon client.js"
+    },
+    "dependencies": {
+      "axios": "^1.6.0",
+      "node-fetch": "^2.6.9",
+      "ws": "^8.16.0"
+    },
+    "devDependencies": {
+      "nodemon": "^3.0.1"
+    },
+    "engines": {
+      "node": ">=16.x"
+    }
+  }
