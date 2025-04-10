@@ -20,6 +20,10 @@ const {
   LOG_LEVEL = 'info'
 } = process.env;
 
+// --- DEBUG LOGGING: Log the API Key the server has loaded --- 
+console.log(`[DEBUG] Server loaded API_KEY: ${API_KEY ? ('******' + API_KEY.slice(-4)) : 'Not Set'}`);
+// --- END DEBUG LOGGING --- 
+
 // Configure logging levels and functions
 const logLevels = {
   debug: 0,
