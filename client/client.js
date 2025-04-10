@@ -1,43 +1,72 @@
-// client.js - Run this on your Remote Desktop machine
+// client.js - Run this in a restricted network environment
+require('dotenv').config(); // Load .env file
+
 const WebSocket = require('ws');
 const axios = require('axios');
 const fetch = require('node-fetch');
 const https = require('https');
 const http = require('http');
+const HttpsProxyAgent = require('https-proxy-agent');
+const { getProxyForUrl } = require('proxy-from-env');
 
 // Configuration
-const VERCEL_WSS_URL = 'wss://your-vercel-app.vercel.app';  // Replace with your Vercel app URL
-const TARGET_API = 'http://localhost:8081';  // Your internal REST API
+const VERCEL_WSS_URL = process.env.VERCEL_WSS_URL;  // Read from .env file
+const TARGET_API = process.env.TARGET_API;  // Read from .env file
+const API_KEY = process.env.API_KEY; // Read API key from .env file
 const RECONNECT_INTERVAL = 5000;  // Reconnect every 5 seconds if disconnected
 
-// Proxy configuration (if needed)
-// const PROXY_HOST = 'your-corporate-proxy.com';
-// const PROXY_PORT = 8080;
-// const PROXY_USER = 'username';
-// const PROXY_PASS = 'password';
+// Get system proxy settings
+const getSystemProxy = (url) => {
+  try {
+    // Try to get proxy from environment variables
+    const proxyUrl = getProxyForUrl(url);
+    console.log(`System proxy detected: ${proxyUrl || 'None'}`);
+    return proxyUrl;
+  } catch (error) {
+    console.error('Error detecting system proxy:', error.message);
+    return null;
+  }
+};
 
-// Create HTTP/HTTPS agent for internal requests with proxy if needed
-const httpAgent = new http.Agent({
-  keepAlive: true,
-  // You can add proxy settings here if needed
-});
-
-const httpsAgent = new https.Agent({
-  keepAlive: true,
-  rejectUnauthorized: false,  // Set to true in production
-  // You can add proxy settings here if needed
-});
+// Create HTTP/HTTPS agent for internal requests with system proxy if available
+const createAgents = () => {
+  const targetProxy = getSystemProxy(TARGET_API);
+  
+  const httpAgent = new http.Agent({
+    keepAlive: true,
+  });
+  
+  let httpsAgent = new https.Agent({
+    keepAlive: true,
+    rejectUnauthorized: false,  // Set to true in production
+  });
+  
+  // If system proxy is detected, use it
+  if (targetProxy) {
+    console.log(`Using system proxy for internal requests: ${targetProxy}`);
+    httpsAgent = new HttpsProxyAgent(targetProxy);
+  }
+  
+  return { httpAgent, httpsAgent };
+};
 
 // Function to create WebSocket connection
 function connectWebSocket() {
   console.log(`Connecting to ${VERCEL_WSS_URL}...`);
   
+  // Get system proxy for WebSocket connection
+  const wsProxy = getSystemProxy(VERCEL_WSS_URL);
+  
   // Create WebSocket connection to Vercel
-  // If proxy is needed, you might need a WebSocket client with proxy support
-  const ws = new WebSocket(VERCEL_WSS_URL, {
-    // For proxy support:
-    // agent: new HttpsProxyAgent(`http://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`)
-  });
+  const wsOptions = {};
+  
+  // If system proxy is detected, use it for WebSocket
+  if (wsProxy) {
+    console.log(`Using system proxy for WebSocket: ${wsProxy}`);
+    wsOptions.agent = new HttpsProxyAgent(wsProxy);
+  }
+  
+  const ws = new WebSocket(VERCEL_WSS_URL, wsOptions);
   
   // Handle connection open
   ws.on('open', () => {
@@ -63,6 +92,9 @@ function connectWebSocket() {
       const headers = { ...request.headers };
       delete headers.host;
       delete headers['content-length'];
+      
+      // Create fresh agents for each request to ensure proxy settings are current
+      const { httpAgent, httpsAgent } = createAgents();
       
       try {
         // Forward request to internal API
@@ -111,12 +143,15 @@ function connectWebSocket() {
   
   // Handle errors
   ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
+    console.error('\x1b[31m%s\x1b[0m', 'WebSocket error: ' + error.message); // Red color for error
+    if (error.message.includes('401')) {
+      console.log('\x1b[33m%s\x1b[0m', 'Hint: Check if the API key is correctly set in the Vercel environment variables.'); // Yellow color for hint
+    }
   });
   
   // Handle disconnection
   ws.on('close', () => {
-    console.log('Disconnected from server. Reconnecting...');
+    console.log('\x1b[33m%s\x1b[0m', 'Disconnected from server. Reconnecting...'); // Yellow color for warning
     setTimeout(connectWebSocket, RECONNECT_INTERVAL);
   });
   
@@ -125,5 +160,5 @@ function connectWebSocket() {
 }
 
 // Start the client
-console.log('Starting WebSocket client to connect to Vercel...');
+console.log('\x1b[36m%s\x1b[0m', 'Starting WebSocket client to connect to Vercel...'); // Cyan color for info
 connectWebSocket();
