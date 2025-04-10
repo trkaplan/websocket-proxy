@@ -39,10 +39,44 @@ const log = (level, message, ...args) => {
 const app = express();
 const server = http.createServer(app);
 
-// Setup WebSocket server with custom path
+// Middleware to validate API key
+const checkApiKey = (req, res, next) => {
+    const apiKey = req.headers['x-api-key'];
+    log('debug', `Checking API Key. Provided: ${apiKey ? 'Yes' : 'No'}`);
+    if (!API_KEY) {
+      log('warn', 'API_KEY is not set in the environment. Allowing request without check.');
+      return next(); // Allow if server has no key configured (development/testing)
+    }
+    if (!apiKey || apiKey !== API_KEY) {
+        log('warn', `Unauthorized access attempt. Provided Key: ${apiKey}`);
+        return res.status(401).json({ error: 'Unauthorized', message: 'Invalid API Key' });
+    }
+    log('debug', 'API Key validated successfully.');
+    next();
+};
+
+// Function to verify WebSocket client during handshake
+const verifyClient = (info, done) => {
+  const apiKey = info.req.headers['x-api-key'];
+  log('debug', `Verifying WebSocket connection. Provided API Key: ${apiKey ? 'Yes' : 'No'}`);
+  if (!API_KEY) {
+      log('warn', 'API_KEY is not set in the environment. Allowing WS connection without check.');
+      return done(true); // Allow if server has no key configured
+  }
+  if (apiKey && apiKey === API_KEY) {
+    log('debug', 'WebSocket API Key validated successfully.');
+    done(true); // API key is valid
+  } else {
+    log('warn', `WebSocket connection rejected. Invalid API Key provided: ${apiKey}`);
+    done(false, 401, 'Unauthorized: Invalid API Key'); // Reject connection
+  }
+};
+
+// Setup WebSocket server with custom path and client verification
 const wss = new WebSocket.Server({ 
   server,
-  path: WS_PATH
+  path: WS_PATH,
+  verifyClient: verifyClient // Add verification hook
 });
 
 // Enable CORS for cross-origin requests
@@ -60,26 +94,16 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Middleware to validate API key
-const checkApiKey = (req, res, next) => {
-    const apiKey = req.headers['x-api-key'];
-    if (!apiKey || apiKey !== API_KEY) {
-        return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
-    }
-    next();
-};
-
-// Apply API key middleware to all routes
-app.use(checkApiKey);
-
 // Store connected WebSocket clients
 const connectedClients = new Map();
 let clientIdCounter = 1;
 
 // Handle WebSocket connections
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   const clientId = clientIdCounter++;
-  log('info', `Remote client ${clientId} connected`);
+  // Extract client IP from headers if possible (useful for logging)
+  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  log('info', `Remote client ${clientId} connected from ${clientIp}`);
   
   // Store client connection with metadata
   connectedClients.set(clientId, {
@@ -137,7 +161,7 @@ wss.on('connection', (ws) => {
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => {
+app.get('/health', checkApiKey, (req, res) => {
   const clientCount = connectedClients.size;
   res.status(200).json({
     status: 'ok',
@@ -148,7 +172,7 @@ app.get('/health', (req, res) => {
 });
 
 // List connected clients endpoint
-app.get('/clients', (req, res) => {
+app.get('/clients', checkApiKey, (req, res) => {
   const clients = Array.from(connectedClients.keys()).map(id => ({
     id,
     pendingRequests: connectedClients.get(id).pendingRequests.size
@@ -160,7 +184,7 @@ app.get('/clients', (req, res) => {
 });
 
 // API proxy endpoint for forwarding requests
-app.all('/api/:clientId/*', async (req, res) => {
+app.all('/api/:clientId/*', checkApiKey, async (req, res) => {
   // Extract client ID from URL
   const clientId = parseInt(req.params.clientId, 10);
   
